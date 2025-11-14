@@ -362,18 +362,79 @@ def execute_research(question: str, max_per_platform: int, debug: bool = False) 
         }
     return payload
 
+def _batch_execute_research(
+    questions: List[str],
+    max_per_platform: int,
+    debug: bool,
+) -> Dict[str, Any]:
+    # Clean and enforce 1–5 questions
+    cleaned_questions = [q.strip() for q in questions if q and q.strip()]
 
+    if not cleaned_questions:
+        # This will surface as an error in the job result
+        raise ValueError("At least one non-empty question is required.")
+
+    if len(cleaned_questions) > 5:
+        cleaned_questions = cleaned_questions[:5]
+
+    answers: List[Dict[str, Any]] = []
+    debug_payloads: List[Dict[str, Any]] = []
+
+    for idx, q in enumerate(cleaned_questions, start=1):
+        # Re-use existing single-question pipeline
+        res = execute_research(q, max_per_platform, debug=debug)
+        final_results = res.get("final_results", [])
+
+        if not isinstance(final_results, list):
+            final_results = [str(final_results)]
+
+        answers.append(
+            {
+                "index": idx,
+                "question": q,
+                "results": final_results,
+            }
+        )
+
+        if debug:
+            debug_payloads.append(
+                {
+                    "index": idx,
+                    "question": q,
+                    "debug": res.get("debug", {}),
+                }
+            )
+
+    payload: Dict[str, Any] = {"answers": answers}
+    if debug:
+        payload["debug"] = debug_payloads
+
+    return payload
+
+
+
+# async def research_processor(payload: Dict[str, Any]) -> Dict[str, Any]:
+#     question = payload.get("question") or ""
+#     max_per_platform = int(payload.get("max_per_platform", 1))
+#     debug = bool(payload.get("debug", False))
+#     return await asyncio.to_thread(
+#         execute_research,
+#         question,
+#         max_per_platform,
+#         debug,
+#     )
 async def research_processor(payload: Dict[str, Any]) -> Dict[str, Any]:
-    question = payload.get("question") or ""
+    questions = payload.get("questions") or []
     max_per_platform = int(payload.get("max_per_platform", 1))
     debug = bool(payload.get("debug", False))
+
+    # Run the whole batch in a worker thread
     return await asyncio.to_thread(
-        execute_research,
-        question,
+        _batch_execute_research,
+        questions,
         max_per_platform,
         debug,
     )
-
 
 # sirf research processor register karein (no refine)
 job_manager.register_processor("research", research_processor)
@@ -444,39 +505,53 @@ class OpinionPollResponse(BaseModel):
     answers: List[OpinionAnswer]
 
 
-@app.post("/opinion_poll", response_model=OpinionPollResponse)
-def opinion_poll(req: OpinionPollRequest):
-    # Clean empty questions, enforce 1–5
-    cleaned_questions = [q.strip() for q in req.questions if q and q.strip()]
+# @app.post("/opinion_poll", response_model=OpinionPollResponse)
+# def opinion_poll(req: OpinionPollRequest):
+#     # Clean empty questions, enforce 1–5
+#     cleaned_questions = [q.strip() for q in req.questions if q and q.strip()]
 
-    if not cleaned_questions:
-        raise HTTPException(status_code=400, detail="At least one non-empty question is required.")
+#     if not cleaned_questions:
+#         raise HTTPException(status_code=400, detail="At least one non-empty question is required.")
 
-    if len(cleaned_questions) > 5:
-        cleaned_questions = cleaned_questions[:5]
+#     if len(cleaned_questions) > 5:
+#         cleaned_questions = cleaned_questions[:5]
 
-    answers: List[OpinionAnswer] = []
+#     answers: List[OpinionAnswer] = []
 
-    # Sequential processing as requested
-    for idx, q in enumerate(cleaned_questions, start=1):
-        results = perform_research(q, req.max_per_platform)
-        answers.append(
-            OpinionAnswer(
-                index=idx,
-                question=q,
-                results=results,
-            )
-        )
+#     # Sequential processing as requested
+#     for idx, q in enumerate(cleaned_questions, start=1):
+#         results = perform_research(q, req.max_per_platform)
+#         answers.append(
+#             OpinionAnswer(
+#                 index=idx,
+#                 question=q,
+#                 results=results,
+#             )
+#         )
 
-    return OpinionPollResponse(answers=answers)
+#     return OpinionPollResponse(answers=answers)
 
 
 # ---- MODELS: job-based /research ----
 
 class ResearchRequest(BaseModel):
-    question: str = Field(..., description="The user question / topic to research.")
-    max_per_platform: int = Field(1, ge=1, le=20, description="Max URLs per platform to collect.")
-    debug: bool = Field(False, description="If true, include intermediate outputs.")
+    questions: List[str] = Field(
+        ...,
+        min_items=1,
+        max_items=5,
+        description="1 to 5 questions / topics to research.",
+    )
+    max_per_platform: int = Field(
+        1,
+        ge=1,
+        le=20,
+        description="Max URLs per platform to collect.",
+    )
+    debug: bool = Field(
+        False,
+        description="If true, include intermediate outputs for each question.",
+    )
+
 
 
 class JobSubmissionResponse(BaseModel):

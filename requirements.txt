@@ -4,3 +4,4 @@ langgraph>=0.6.4
 python-dotenv>=1.1.1
 fastapi
 uvicorn[standard]
+aiosqlite>=0.20.0

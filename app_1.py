@@ -9,12 +9,9 @@ from pydantic import BaseModel, Field
 from BOL import serp_search
 from urls_scrappers import collect_platform_urls
 import uvicorn
-from pathlib import Path
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from job_queue import JobManager, JobRecord
-import asyncio
 
 from BOL import ( reddit_comment_retrieval, youtube_post_retrieval, tiktok_post_retrieval,
                   instagram_comments_retrieval, facebook_comments_retrieval,
@@ -23,26 +20,6 @@ from BOL import ( reddit_comment_retrieval, youtube_post_retrieval, tiktok_post_
 load_dotenv()
 
 BRIGHTDATA_API_KEY = os.getenv("BRIGHTDATA_API_KEY")
-API_TOKEN = os.getenv("API_TOKEN")
-
-# Security
-security = HTTPBearer()
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verify the API token from Authorization header."""
-    if not API_TOKEN:
-        raise HTTPException(
-            status_code=500,
-            detail="API token not configured on server"
-        )
-    
-    token = credentials.credentials
-    if token != API_TOKEN:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or missing API token"
-        )
-    return token
 
 # Initialize State
 class State(TypedDict):
@@ -321,19 +298,21 @@ graph_builder.add_edge("final_results", END)
 
 graph = graph_builder.compile()
 
-# --- Job infrastructure ---
-JOB_DB_PATH = Path(__file__).resolve().parent / "jobs.db"
-JOB_WORKER_COUNT = int(os.getenv("JOB_WORKERS", "1"))
-job_manager = JobManager(db_path=JOB_DB_PATH, worker_count=JOB_WORKER_COUNT)
-
 # ==========================
 #   RESEARCH WRAPPER
 # ==========================
 
-def execute_research(question: str, max_per_platform: int, debug: bool = False) -> Dict[str, Any]:
+def perform_research(user_question: str, max_per_platform: int) -> List[str]:
+    """
+    Runs the graph once for a single question, without storing or using history.
+    Returns final curated results (list/strings as produced by results_curation).
+    """
+    print("\nStarting parallel research process...")
+    print("Launching Google, Bing, LinkedIn, Instagram, X, TikTok, YouTube, Facebook...\n")
+
     state: State = {
-        "messages": [{"role": "user", "content": question}],
-        "user_question": question,
+        "messages": [{"role": "user", "content": user_question}],
+        "user_question": user_question,
         "max_per_platform": max_per_platform,
         "google_results": None,
         "bing_results": None,
@@ -348,50 +327,12 @@ def execute_research(question: str, max_per_platform: int, debug: bool = False) 
         "combined_comments": None,
         "final_results": None,
     }
-
     final_state = graph.invoke(state)
-    final_results = final_state.get("final_results", "No results found.")
-
-    payload: Dict[str, Any] = {"final_results": final_results}
-    if debug:
-        payload["debug"] = {
-            "platform_urls": final_state.get("platform_urls"),
-            "google_results": final_state.get("google_results"),
-            "bing_results": final_state.get("bing_results"),
-            "combined_comments": final_state.get("combined_comments"),
-        }
-    return payload
-
-
-async def research_processor(payload: Dict[str, Any]) -> Dict[str, Any]:
-    question = payload.get("question") or ""
-    max_per_platform = int(payload.get("max_per_platform", 1))
-    debug = bool(payload.get("debug", False))
-    return await asyncio.to_thread(
-        execute_research,
-        question,
-        max_per_platform,
-        debug,
-    )
-
-
-# sirf research processor register karein (no refine)
-job_manager.register_processor("research", research_processor)
-
-
-def perform_research(user_question: str, max_per_platform: int) -> List[str]:
-    print("\nStarting parallel research process...")
-    print("Launching Google, Bing, LinkedIn, Instagram, X, TikTok, YouTube, Facebook...\n")
-
-    research_output = execute_research(user_question, max_per_platform, debug=False)
-    final_results = research_output.get("final_results", [])
-    if not isinstance(final_results, list):
-        final_results = [str(final_results)]
-    return final_results
+    return final_state.get("final_results", [])
 
 
 # ==========================
-#   FASTAPI APP
+#   FASTAPI PART
 # ==========================
 
 app = FastAPI(
@@ -400,6 +341,7 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# Optional: allow all origins (useful for dev / Postman / frontends)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -409,25 +351,7 @@ app.add_middleware(
 )
 
 
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "has_brightdata_key": bool(BRIGHTDATA_API_KEY),
-    }
-
-
-@app.on_event("startup")
-async def _startup_job_manager() -> None:
-    await job_manager.start()
-
-
-@app.on_event("shutdown")
-async def _shutdown_job_manager() -> None:
-    await job_manager.stop()
-
-
-# ---- MODELS: opinion_poll ----
+# ---- Request & Response Models ----
 
 class OpinionPollRequest(BaseModel):
     questions: List[str]          # 1 to 5 questions
@@ -444,6 +368,8 @@ class OpinionPollResponse(BaseModel):
     answers: List[OpinionAnswer]
 
 
+# ---- MAIN ENDPOINT: /opinion_poll ----
+
 @app.post("/opinion_poll", response_model=OpinionPollResponse)
 def opinion_poll(req: OpinionPollRequest):
     # Clean empty questions, enforce 1–5
@@ -457,74 +383,20 @@ def opinion_poll(req: OpinionPollRequest):
 
     answers: List[OpinionAnswer] = []
 
-    # Sequential processing as requested
     for idx, q in enumerate(cleaned_questions, start=1):
         results = perform_research(q, req.max_per_platform)
+        if not isinstance(results, list):
+            results = [str(results)]
+
         answers.append(
             OpinionAnswer(
                 index=idx,
                 question=q,
-                results=results,
+                results=results
             )
         )
 
     return OpinionPollResponse(answers=answers)
-
-
-# ---- MODELS: job-based /research ----
-
-class ResearchRequest(BaseModel):
-    question: str = Field(..., description="The user question / topic to research.")
-    max_per_platform: int = Field(1, ge=1, le=20, description="Max URLs per platform to collect.")
-    debug: bool = Field(False, description="If true, include intermediate outputs.")
-
-
-class JobSubmissionResponse(BaseModel):
-    job_id: str
-    status_url: Optional[str] = Field(
-        default=None,
-        description="Endpoint to poll for job status.",
-    )
-
-
-class JobStatusResponse(BaseModel):
-    job_id: str
-    type: str
-    status: str
-    result: Optional[Any] = None
-    error: Optional[str] = None
-    created_at: str
-    updated_at: str
-
-
-@app.post("/research", response_model=JobSubmissionResponse)
-async def research(req: ResearchRequest, request: Request, token: str = Depends(verify_token)):
-    try:
-        job_id = await job_manager.enqueue_job("research", req.dict())
-        return JobSubmissionResponse(
-            job_id=job_id,
-            status_url=str(request.url_for("job_status", job_id=job_id)),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/jobs/{job_id}", response_model=JobStatusResponse, name="job_status")
-async def job_status(job_id: str, token: str = Depends(verify_token)):
-    record: Optional[JobRecord] = await job_manager.fetch_job(job_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Job not found.")
-
-    result = record.result if record.status == "completed" else None
-    return JobStatusResponse(
-        job_id=record.id,
-        type=record.type,
-        status=record.status,
-        result=result,
-        error=record.error,
-        created_at=record.created_at,
-        updated_at=record.updated_at,
-    )
 
 
 # ==========================
